@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: shruti-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    rootDir: .
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GEMINI_API_URL
+        value: https://api.openai.com/v1/chat/completions
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gpt-4o-mini
+      - key: __firebase_config
+        sync: false
+      - key: __initial_auth_token
+        sync: false
+      - key: __app_id
+        value: shruti-prod

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Envs
+.env
+
+# Local files
+users.json
+
+# IDE
+.vscode/
+.idea/
