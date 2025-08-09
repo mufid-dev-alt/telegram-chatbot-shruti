@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -37,8 +38,9 @@ logging.basicConfig(
 logger = logging.getLogger("shruti-bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_API_URL = os.getenv("GEMINI_API_URL", "").strip()
+OPENAI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # Using existing env var name
+OPENAI_API_URL = os.getenv("GEMINI_API_URL", "").strip()  # Using existing env var name
+OPENAI_MODEL = os.getenv("GEMINI_MODEL", "gpt-4o-mini")  # Using existing env var name
 FIREBASE_CONFIG = os.getenv("__firebase_config", "").strip()
 INITIAL_AUTH_TOKEN = os.getenv("__initial_auth_token", "").strip()
 APP_ID = os.getenv("__app_id", "app")
@@ -307,7 +309,7 @@ async def generate_shruti_reply(user_name: str, original_message: str, history: 
     system_prompt = build_system_persona()
 
     # Check if we have the required credentials
-    if not GEMINI_API_URL or not GEMINI_API_KEY:
+    if not OPENAI_API_URL or not OPENAI_API_KEY:
         logger.warning("LLM credentials missing. Falling back to a canned witty response.")
         return (
             f"Hey {user_name}, my brain is on airplane mode right now. "
@@ -315,12 +317,12 @@ async def generate_shruti_reply(user_name: str, original_message: str, history: 
         )
 
     # Log the API call for debugging
-    logger.info(f"Calling LLM API for user {user_name} with message: {original_message[:100]}...")
-    logger.info(f"API URL: {GEMINI_API_URL}")
-    logger.info(f"API Key present: {'Yes' if GEMINI_API_KEY else 'No'}")
+    logger.info(f"Calling OpenAI API for user {user_name} with message: {original_message[:100]}...")
+    logger.info(f"API URL: {OPENAI_API_URL}")
+    logger.info(f"API Key present: {'Yes' if OPENAI_API_KEY else 'No'}")
 
     payload = {
-        "model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -338,7 +340,7 @@ async def generate_shruti_reply(user_name: str, original_message: str, history: 
         "temperature": 0.8,
         "max_tokens": 220,
     }
-    headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
     text = await call_llm_with_retry(payload, headers)
     if text:
@@ -346,7 +348,7 @@ async def generate_shruti_reply(user_name: str, original_message: str, history: 
         return text
     
     # If we get here, the LLM call failed - provide a more helpful fallback
-    logger.error("LLM API call failed completely")
+    logger.error("OpenAI API call failed completely")
     return (
         f"Hey {user_name}! I'm having trouble connecting to my AI brain right now. "
         "This usually means either my API key is missing, the endpoint is wrong, or the service is down. "
@@ -497,9 +499,9 @@ async def debug() -> JSONResponse:
     """Debug endpoint to check environment variables and API status"""
     debug_info = {
         "telegram_token_present": bool(TELEGRAM_TOKEN),
-        "gemini_api_key_present": bool(GEMINI_API_KEY),
-        "gemini_api_url": GEMINI_API_URL,
-        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        "openai_api_key_present": bool(OPENAI_API_KEY),
+        "openai_api_url": OPENAI_API_URL,
+        "openai_model": OPENAI_MODEL,
         "firebase_config_present": bool(FIREBASE_CONFIG),
         "app_id": APP_ID,
         "bot_username": bot_username,
