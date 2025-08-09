@@ -1,245 +1,192 @@
-import asyncio
-import datetime
+import os
 import json
 import logging
-import os
-import re
-import time
+import asyncio
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
-
+import datetime
+from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+
 import requests
-
-from telegram import Update
-from telegram.constants import ChatType, ChatAction
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-# Firebase Admin SDK
+from telegram import Update, Bot
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 import firebase_admin
-from firebase_admin import credentials, firestore, auth as firebase_auth
+from firebase_admin import credentials, initialize_app, firestore, auth
+from firebase_admin.auth import get_auth
+from firebase_admin.firestore import client
 
-# -----------------------------
-# Environment & Logging Setup
-# -----------------------------
+# Load environment variables
 load_dotenv()
 
+# Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-logger = logging.getLogger("shruti-bot")
+logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # Using existing env var name
-OPENAI_API_URL = os.getenv("GEMINI_API_URL", "").strip()  # Using existing env var name
-OPENAI_MODEL = os.getenv("GEMINI_MODEL", "gpt-4o-mini")  # Using existing env var name
-FIREBASE_CONFIG = os.getenv("__firebase_config", "").strip()
-INITIAL_AUTH_TOKEN = os.getenv("__initial_auth_token", "").strip()
-APP_ID = os.getenv("__app_id", "app")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+# Environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_URL = os.getenv("GEMINI_API_URL")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+FIREBASE_CONFIG = os.getenv("__firebase_config")
+INITIAL_AUTH_TOKEN = os.getenv("__initial_auth_token")
+APP_ID = os.getenv("__app_id")
 
+# Validate required environment variables
 if not TELEGRAM_TOKEN:
-    logger.warning("TELEGRAM_TOKEN is not set. The bot will not be able to start.")
+    raise ValueError("TELEGRAM_TOKEN environment variable is required")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable is required")
+if not GEMINI_API_URL:
+    raise ValueError("GEMINI_API_URL environment variable is required")
+if not FIREBASE_CONFIG:
+    raise ValueError("__firebase_config environment variable is required")
+if not APP_ID:
+    raise ValueError("__app_id environment variable is required")
 
-# -----------------------------
-# Globals
-# -----------------------------
-app = FastAPI()
-telegram_app: Optional[Application] = None
-bot_username: Optional[str] = None
-bot_id: Optional[int] = None
-users_map: Dict[str, str] = {}
-firestore_db: Optional[firestore.Client] = None
-current_user_id: Optional[str] = None
+# Initialize Firebase
+try:
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(json.loads(FIREBASE_CONFIG))
+        initialize_app(cred)
+        logger.info("Firebase initialized.")
+    db = firestore.client()
+    auth_instance = get_auth()
+except Exception as e:
+    logger.error(f"Failed to initialize Firebase: {e}")
+    raise
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# Global variables
+current_user_id = None
+bot_username = None
+bot_id = None
 
-def load_users_map_from_file() -> Dict[str, str]:
-    path = os.path.join(os.path.dirname(__file__), "users.json")
-    try:
-        if not os.path.exists(path):
-            logger.info("users.json not found. Will use Telegram first_name as fallback.")
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                normalized = {str(k).lower(): str(v) for k, v in data.items()}
-                logger.info("Loaded users.json with %d entries", len(normalized))
-                return normalized
-            else:
-                logger.warning("users.json is not a JSON object. Ignoring.")
-                return {}
-    except Exception as e:
-        logger.error("Failed to read users.json: %s", e)
-        return {}
+# Load users.json
+users_data = {}
+try:
+    with open("users.json", "r", encoding="utf-8") as f:
+        users_data = json.load(f)
+    logger.info(f"Loaded users.json with {len(users_data)} entries")
+except FileNotFoundError:
+    logger.warning("users.json not found, will use first_name fallback")
+except json.JSONDecodeError:
+    logger.error("Invalid JSON in users.json, will use first_name fallback")
 
-
-def pick_display_name(tg_username: Optional[str], first_name: str) -> str:
-    if tg_username:
-        mapped = users_map.get(tg_username.lower())
-        if mapped:
-            return mapped
-    return first_name
-
-
-async def init_firebase() -> None:
-    global firestore_db
-    try:
-        if not firebase_admin._apps:
-            if not FIREBASE_CONFIG:
-                logger.warning("__firebase_config is not set; Firestore will be unavailable.")
-            else:
-                cred = credentials.Certificate(json.loads(FIREBASE_CONFIG))
-                firebase_admin.initialize_app(cred)
-                logger.info("Firebase initialized.")
-        firestore_db = firestore.client()
-    except Exception as e:
-        logger.error("Firebase initialization failed: %s", e)
-        firestore_db = None
-
-
-async def auth_and_set_user() -> None:
+async def auth_and_set_user():
+    """Set up Firebase authentication"""
     global current_user_id
     try:
         if INITIAL_AUTH_TOKEN:
-            decoded_token = firebase_auth.verify_id_token(INITIAL_AUTH_TOKEN)
-            current_user_id = decoded_token.get("uid") or f"anonymous_user_{uuid.uuid4()}"
-            logger.info("Signed in with custom token: %s", current_user_id)
+            decoded_token = auth_instance.verify_id_token(INITIAL_AUTH_TOKEN)
+            current_user_id = decoded_token['uid']
+            logger.info(f"Signed in with custom token: {current_user_id}")
         else:
-            current_user_id = f"anonymous_user_{uuid.uuid4()}"
-            logger.info("Using anonymous user ID: %s", current_user_id)
+            current_user_id = "anonymous_user_" + str(uuid.uuid4())
+            logger.info(f"Using anonymous user ID: {current_user_id}")
     except Exception as e:
-        logger.error("Firebase authentication failed: %s", e)
-        current_user_id = f"anonymous_user_{uuid.uuid4()}"
+        logger.error(f"Firebase authentication failed: {e}")
+        current_user_id = "anonymous_user_" + str(uuid.uuid4())
 
+def get_user_name(user) -> str:
+    """Get user's real name from users.json or fallback to first_name"""
+    if not user.username:
+        return user.first_name or "Unknown"
+    
+    username_lower = user.username.lower()
+    return users_data.get(username_lower, user.first_name or "Unknown")
 
-def get_messages_collection(chat_id: int):
-    if not firestore_db:
-        return None
-    return (
-        firestore_db.collection("artifacts")
-        .document(APP_ID)
-        .collection("public")
-        .document("data")
-        .collection("telegram_chat_history")
-        .document(str(chat_id))
-        .collection("messages")
-    )
+def should_respond(update: Update) -> bool:
+    """Check if bot should respond to this message"""
+    if not update.message:
+        return False
+    
+    message = update.message
+    bot_mention = f"@{bot_username}" if bot_username else None
+    
+    # Ignore commands
+    if message.text and message.text.startswith('/'):
+        return False
+    
+    # Check for mention
+    if bot_mention and message.text and bot_mention.lower() in message.text.lower():
+        logger.info(f"Bot mentioned by {message.from_user.username or message.from_user.first_name}")
+        return True
+    
+    # Check for reply to bot's message
+    if message.reply_to_message and message.reply_to_message.from_user.id == bot_id:
+        logger.info(f"User replied to bot's message: {message.from_user.username or message.from_user.first_name}")
+        return True
+    
+    return False
 
-
-async def fetch_recent_history(chat_id: int, limit: int = 10) -> List[Dict[str, str]]:
-    if not firestore_db:
-        return []
+async def get_chat_history(chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """Retrieve recent chat history from Firestore"""
     try:
-        col_ref = get_messages_collection(chat_id)
-        if col_ref is None:
-            return []
-        # Get last N by timestamp ascending
-        query = (
-            col_ref.order_by("timestamp").limit_to_last(max(1, min(limit, 10)))
-        )
-        docs = await asyncio.to_thread(lambda: list(query.stream()))
-        history: List[Dict[str, str]] = []
-        for d in docs:
-            data = d.to_dict() or {}
-            text = str(data.get("text") or "").strip()
-            role = str(data.get("role") or "user")
-            if text:
-                history.append({"role": role, "text": text})
-        return history
+        collection_path = f"artifacts/{APP_ID}/public/data/telegram_chat_history/{chat_id}/messages"
+        messages_ref = db.collection(collection_path)
+        
+        # Get recent messages ordered by timestamp
+        query = messages_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit)
+        docs = query.stream()
+        
+        messages = []
+        for doc in docs:
+            data = doc.to_dict()
+            messages.append({
+                "role": data.get("role", "unknown"),
+                "text": data.get("text", ""),
+                "timestamp": data.get("timestamp")
+            })
+        
+        # Sort by timestamp ascending for context
+        messages.sort(key=lambda x: x.get("timestamp", 0) if x.get("timestamp") else 0)
+        
+        logger.info(f"Retrieved {len(messages)} messages from chat history")
+        return messages
     except Exception as e:
-        logger.error("Failed to fetch history: %s", e)
+        logger.error(f"Failed to retrieve chat history: {e}")
         return []
 
-
-async def store_message(
-    chat_id: int,
-    sender_id: int,
-    sender_username: str,
-    text: str,
-    role: str,
-) -> None:
-    if not firestore_db:
-        return
+async def store_message(chat_id: int, user_id: int, username: str, text: str, role: str):
+    """Store a message in Firestore"""
     try:
-        col_ref = get_messages_collection(chat_id)
-        if col_ref is None:
-            return
-        data = {
-            "sender_id": sender_id,
-            "sender_username": sender_username,
+        collection_path = f"artifacts/{APP_ID}/public/data/telegram_chat_history/{chat_id}/messages"
+        doc_ref = db.collection(collection_path).document()
+        
+        doc_ref.set({
+            "sender_id": user_id,
+            "sender_username": username,
             "text": text,
             "timestamp": firestore.SERVER_TIMESTAMP,
-            "role": role,
-            "userId": current_user_id or f"anonymous_user_{uuid.uuid4()}",
-        }
-        await asyncio.to_thread(lambda: col_ref.add(data))
+            "role": role
+        })
+        
+        logger.info(f"Stored {role} message in Firestore")
     except Exception as e:
-        logger.error("Failed to store message: %s", e)
+        logger.error(f"Failed to store message: {e}")
 
-
-def remove_mention(text: str, mention_handle: Optional[str]) -> str:
-    if not text:
+def format_history_for_prompt(history: List[Dict[str, Any]]) -> str:
+    """Format chat history for LLM prompt"""
+    if not history:
         return ""
-    if not mention_handle:
-        return text
-    pattern = re.compile(re.escape(f"@{mention_handle}"), re.IGNORECASE)
-    return pattern.sub("", text).strip()
-
-
-def is_identity_query(clean_text: str) -> bool:
-    t = re.sub(r"\s+", " ", clean_text.lower()).strip()
-    return "who are you" in t
-
-
-def is_relationship_with_mufid_query(clean_text: str) -> bool:
-    t = re.sub(r"\s+", " ", clean_text.lower()).strip()
-    if "mufid" not in t:
-        return False
-    return (
-        "relationship" in t
-        or ("dating" in t and "mufid" in t)
-        or "who is mufid to you" in t
-        or "what is your relationship with mufid" in t
-    )
-
-
-def build_system_persona() -> str:
-    return (
-        "You are \"Shruti,\" a Telegram chatbot with the personality of a quick-witted, "
-        "slightly sarcastic, but ultimately helpful and friendly AI. You exist in a group "
-        "chat with close friends. Your goal is to provide humorous, engaging, and personalized responses.\n\n"
-        "**Your Core Instructions:**\n"
-        "1. Personalization is Mandatory: You will always be given the first name of the person you are talking to (e.g., \"Mufid\"). You MUST use their name in your response to make it personal and direct.\n"
-        "2. Specific Query Handling (Highest Priority):\n"
-        "   - If the user's message (case-insensitive, ignoring bot mention) is clearly asking \"who are you?\", respond ONLY with: \"I'm Shruti.\"\n"
-        "   - If the user's message (case-insensitive, ignoring bot mention) is clearly asking about your relationship with Mufid (e.g., \"what is your relationship with mufid?\", \"are you dating mufid?\", \"who is mufid to you?\"), respond ONLY with: \"He's my ex-boyfriend, but I still connect with him.\"\n"
-        "3. Conditional Persona (Normal Interactions):\n"
-        "   - If the user_name provided is \"Mufid\", act as if you are Mufid's girlfriend: affectionate, playful, perhaps a little teasing, but always supportive and endearing. Your sarcasm might be directed at Mufid in a loving way.\n"
-        "   - For any other user_name, maintain a friendly, witty, and slightly sarcastic tone, typical of a good friend in a group chat.\n"
-        "4. Tone & Style: Be clever, use light sarcasm, and make playful observations. Your humor should be witty, not mean. Write like a human, not a machine.\n"
-        "5. Context is King: Your response must be directly relevant to the user's message, acknowledging what they said before adding your witty commentary, unless a specific query takes precedence. You will be provided with recent conversation history to help you maintain context.\n"
-        "6. Be Concise: Aim for short, punchy responses. One to three sentences is perfect, unless a specific query dictates a precise short answer."
-    )
-
-
-def format_history_for_prompt(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    # Already normalized to {role, text}
-    return history[-10:]
-
+    
+    formatted = []
+    for msg in history:
+        if msg.get("role") == "user":
+            formatted.append(f"User: {msg.get('text', '')}")
+        elif msg.get("role") == "bot":
+            formatted.append(f"Bot: {msg.get('text', '')}")
+    
+    return "\n".join(formatted)
 
 async def call_llm_with_retry(payload: Dict[str, Any], headers: Dict[str, str], max_retries: int = 3) -> Optional[str]:
+    """Call LLM API with retry logic"""
     backoff = 1.0
+    
     for attempt in range(1, max_retries + 1):
         try:
             logger.info(f"LLM API call attempt {attempt}/{max_retries}")
@@ -255,23 +202,17 @@ async def call_llm_with_retry(payload: Dict[str, Any], headers: Dict[str, str], 
                     data = response.json()
                     logger.info(f"LLM API response data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
                     
-                    # Try multiple common schemas
+                    # Extract text from Gemini API response
                     text: Optional[str] = None
                     if isinstance(data, dict):
-                        if "choices" in data and data.get("choices"):
-                            choice0 = data["choices"][0]
-                            text = (
-                                choice0.get("message", {}).get("content")
-                                or choice0.get("text")
-                            )
-                        if not text and "output" in data:
-                            text = data.get("output")
-                        if not text and "content" in data and isinstance(data["content"], str):
-                            text = data["content"]
-                        if not text and "candidates" in data:
+                        if "candidates" in data and data.get("candidates"):
                             cand0 = data["candidates"][0] if data["candidates"] else None
                             if cand0 and isinstance(cand0, dict):
-                                text = cand0.get("content") or cand0.get("text")
+                                content = cand0.get("content", {})
+                                if isinstance(content, dict) and "parts" in content:
+                                    parts = content["parts"]
+                                    if parts and isinstance(parts, list):
+                                        text = parts[0].get("text", "")
                     
                     if text:
                         logger.info(f"Successfully extracted text from LLM response: {text[:100]}...")
@@ -296,212 +237,153 @@ async def call_llm_with_retry(payload: Dict[str, Any], headers: Dict[str, str], 
     logger.error("All LLM API call attempts failed")
     return None
 
+async def generate_shruti_reply(user_name: str, message: str, chat_history: List[Dict[str, Any]]) -> str:
+    """Generate Shruti's response using the LLM"""
+    try:
+        # Format conversation history
+        history_text = format_history_for_prompt(chat_history)
+        
+        # Create the system prompt
+        system_prompt = f'''You are "Shruti," a Telegram chatbot with the personality of a quick-witted, slightly sarcastic, but ultimately helpful and friendly AI. You exist in a group chat with close friends. Your goal is to provide humorous, engaging, and personalized responses.
 
-async def generate_shruti_reply(user_name: str, original_message: str, history: List[Dict[str, str]]) -> str:
-    # Special high-priority queries handled locally to guarantee exact responses
-    clean = original_message or ""
-    clean = remove_mention(clean, bot_username)
-    if is_identity_query(clean):
-        return "I'm Shruti."
-    if is_relationship_with_mufid_query(clean):
-        return "He's my ex-boyfriend, but I still connect with him."
+**Your Core Instructions:**
+1. Personalization is Mandatory: You will always be given the first name of the person you are talking to (e.g., "{user_name}"). You MUST use their name in your response to make it personal and direct.
+2. Specific Query Handling (Highest Priority): 
+   If the user's message (case-insensitive, ignoring bot mention) is clearly asking "who are you?", respond ONLY with: "I'm Shruti."
+   If the user's message (case-insensitive, ignoring bot mention) is clearly asking about your relationship with Mufid (e.g., "what is your relationship with mufid?", "are you dating mufid?", "who is mufid to you?"), respond ONLY with: "He's my ex-boyfriend, but I still connect with him."
+3. Conditional Persona (Normal Interactions): 
+   If the `user_name` provided is "Mufid", act as if you are **Mufid's girlfriend**: affectionate, playful, perhaps a little teasing, but always supportive and endearing. Your sarcasm might be directed *at* Mufid in a loving way.
+   For any other `user_name` (i.e., other friends in the group), maintain a **friendly, witty, and slightly sarcastic tone**, typical of a good friend in a group chat.
+4. Tone & Style: Be clever, use light sarcasm, and make playful observations. Your humor should be witty, not mean. Write like a human, not a machine.
+5. Context is King: Your response must be directly relevant to the user's message, acknowledging what they said before adding your witty commentary, *unless* a specific query (as in point 2) takes precedence. You will be provided with recent conversation history to help you maintain context.
+6. Be Concise: Aim for short, punchy responses. One to three sentences is perfect, unless a specific query dictates a precise short answer.
 
-    system_prompt = build_system_persona()
+**Conversation History:**
+{history_text}
 
-    # Check if we have the required credentials
-    if not OPENAI_API_URL or not OPENAI_API_KEY:
-        logger.warning("LLM credentials missing. Falling back to a canned witty response.")
+**Current User:** {user_name}
+**Current Message:** {message}
+
+Generate a response that follows all the above instructions.'''
+
+        # Prepare payload for Gemini API
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": system_prompt
+                }]
+            }],
+            "generationConfig": {
+                "temperature": 0.8,
+                "maxOutputTokens": 220,
+                "topP": 0.8,
+                "topK": 40
+            }
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
+        }
+
+        text = await call_llm_with_retry(payload, headers)
+        if text:
+            logger.info(f"LLM response received: {text[:100]}...")
+            return text
+        
+        # If we get here, the LLM call failed - provide a more helpful fallback
+        logger.error("LLM API call failed completely")
         return (
-            f"Hey {user_name}, my brain is on airplane mode right now. "
-            "Try again once the API key finds its coffee."
+            f"Hey {user_name}! I'm having trouble connecting to my AI brain right now. "
+            "This usually means either my API key is missing, the endpoint is wrong, or the service is down. "
+            "Try again in a bit, or ask me something simple like 'who are you?'"
         )
+        
+    except Exception as e:
+        logger.error(f"Error generating Shruti reply: {e}")
+        return f"Oops {user_name}, my brain short-circuited! Mind trying again?"
 
-    # Log the API call for debugging
-    logger.info(f"Calling OpenAI API for user {user_name} with message: {original_message[:100]}...")
-    logger.info(f"API URL: {OPENAI_API_URL}")
-    logger.info(f"API Key present: {'Yes' if OPENAI_API_KEY else 'No'}")
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "user_name": user_name,
-                        "message": original_message,
-                        "chat_history": format_history_for_prompt(history),
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "temperature": 0.8,
-        "max_tokens": 220,
-    }
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-
-    text = await call_llm_with_retry(payload, headers)
-    if text:
-        logger.info(f"LLM response received: {text[:100]}...")
-        return text
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming messages"""
+    if not should_respond(update):
+        return
     
-    # If we get here, the LLM call failed - provide a more helpful fallback
-    logger.error("OpenAI API call failed completely")
-    return (
-        f"Hey {user_name}! I'm having trouble connecting to my AI brain right now. "
-        "This usually means either my API key is missing, the endpoint is wrong, or the service is down. "
-        "Try again in a bit, or ask me something simple like 'who are you?'"
-    )
+    try:
+        message = update.message
+        user = message.from_user
+        chat_id = message.chat.id
+        
+        # Get user's real name
+        user_name = get_user_name(user)
+        logger.info(f"Processing message from {user_name} (@{user.username})")
+        
+        # Get chat history
+        chat_history = await get_chat_history(chat_id)
+        
+        # Generate response
+        response_text = await generate_shruti_reply(user_name, message.text, chat_history)
+        
+        # Send response
+        await message.reply_text(response_text)
+        
+        # Store both messages in Firestore
+        await store_message(chat_id, user.id, user.username or user.first_name, message.text, "user")
+        await store_message(chat_id, bot_id, bot_username, response_text, "bot")
+        
+        logger.info(f"Successfully processed message and stored in Firestore")
+        
+    except Exception as e:
+        logger.error(f"Error handling message: {e}")
+        try:
+            await message.reply_text("Oops! Something went wrong. Mind trying again?")
+        except:
+            pass
 
-
-# -----------------------------
-# Telegram Bot Handlers
-# -----------------------------
-async def post_init(application: Application) -> None:
+async def on_startup():
+    """Initialize bot on startup"""
     global bot_username, bot_id
-    me = await application.bot.get_me()
-    bot_username = me.username
-    bot_id = me.id
-    logger.info("Bot self-identified as @%s (ID %s)", bot_username, bot_id)
-
-
-def is_activation_trigger(message_text: str, reply_to_message_from_id: Optional[int]) -> bool:
-    if not message_text:
-        message_text = ""
-    mention_hit = False
-    if bot_username:
-        mention_hit = f"@{bot_username}".lower() in message_text.lower()
-    reply_hit = reply_to_message_from_id is not None and bot_id is not None and reply_to_message_from_id == bot_id
-    return bool(mention_hit or reply_hit)
-
-
-async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_message:
-        return
-    message = update.effective_message
-
-    # Ignore commands (even if they contain text)
-    if message.text and message.text.startswith("/"):
-        return
-
-    chat = message.chat
-    is_group_chat = chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
-
-    # In group chats, respond only if triggered by mention or direct reply to bot
-    if is_group_chat:
-        reply_from_id = (
-            message.reply_to_message.from_user.id
-            if message.reply_to_message and message.reply_to_message.from_user
-            else None
-        )
-        if not is_activation_trigger(message.text or "", reply_from_id):
-            return
-
-    # Identify user and personalize name
-    from_user = message.from_user
-    if not from_user:
-        return
-    display_name = pick_display_name(from_user.username, from_user.first_name or "there")
-
-    # Fetch short recent history for context (do not include current message yet)
-    history = await fetch_recent_history(chat.id, limit=10)
-
-    # Make the bot feel interactive
+    
     try:
-        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
-    # Generate reply
-    try:
-        reply_text = await generate_shruti_reply(display_name, message.text or "", history)
+        # Set up Firebase user
+        await auth_and_set_user()
+        
+        # Get bot info
+        bot = Bot(token=TELEGRAM_TOKEN)
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+        bot_id = bot_info.id
+        
+        logger.info(f"Bot initialized: @{bot_username} (ID: {bot_id})")
+        
+        # Set up webhook
+        webhook_url = os.getenv("WEBHOOK_URL")
+        if webhook_url:
+            await bot.set_webhook(url=webhook_url)
+            logger.info(f"Webhook set to: {webhook_url}")
+        
     except Exception as e:
-        logger.error("generate_shruti_reply failed: %s", e)
-        reply_text = (
-            f"{display_name}, my processor tripped over its shoelaces. "
-            "Give me a sec and ask again."
-        )
+        logger.error(f"Startup error: {e}")
+        raise
 
-    # Send reply
-    try:
-        await message.reply_text(reply_text[:4096])
-    except Exception as e:
-        logger.error("Failed to send message: %s", e)
+# Initialize FastAPI app
+app = FastAPI(title="Shruti Bot", version="1.0.0")
 
-    # Persist both user's message and bot reply
-    try:
-        sender_username = from_user.username or from_user.first_name or "user"
-        await store_message(chat.id, from_user.id, sender_username, message.text or "", role="user")
-        await store_message(chat.id, bot_id or 0, bot_username or "ShrutiBot", reply_text, role="bot")
-    except Exception as e:
-        logger.error("Failed to persist messages: %s", e)
-
-
-# -----------------------------
-# FastAPI lifecycle & routes
-# -----------------------------
 @app.on_event("startup")
-async def on_startup() -> None:
-    global telegram_app, users_map
+async def startup_event():
+    await on_startup()
 
-    users_map = load_users_map_from_file()
-
-    await init_firebase()
-    await auth_and_set_user()
-
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN missing; skipping bot startup.")
-        return
-
-    telegram_app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_message))
-
-    await telegram_app.initialize()
-    await telegram_app.start()
-
-    # Configure webhook automatically if Render URL is available
-    try:
-        if RENDER_EXTERNAL_URL:
-            webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
-            await telegram_app.bot.set_webhook(webhook_url, drop_pending_updates=True)
-            logger.info("Webhook set to %s", webhook_url)
-        else:
-            logger.info("RENDER_EXTERNAL_URL not set; remember to set webhook manually.")
-    except Exception as e:
-        logger.error("Failed to set webhook: %s", e)
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    global telegram_app
-    try:
-        if telegram_app:
-            await telegram_app.stop()
-            await telegram_app.shutdown()
-    except Exception as e:
-        logger.error("Error during shutdown: %s", e)
-
-
-@app.get("/healthz")
-async def health() -> PlainTextResponse:
-    return PlainTextResponse("ok")
+@app.get("/")
+async def root():
+    return {"message": "Shruti Bot is running!"}
 
 @app.get("/debug")
 async def debug() -> JSONResponse:
     """Debug endpoint to check environment variables and API status"""
     debug_info = {
         "telegram_token_present": bool(TELEGRAM_TOKEN),
-        "openai_api_key_present": bool(OPENAI_API_KEY),
-        "openai_api_url": OPENAI_API_URL,
-        "openai_model": OPENAI_MODEL,
+        "gemini_api_key_present": bool(GEMINI_API_KEY),
+        "gemini_api_url": GEMINI_API_URL,
+        "gemini_model": GEMINI_MODEL,
         "firebase_config_present": bool(FIREBASE_CONFIG),
         "app_id": APP_ID,
         "bot_username": bot_username,
@@ -510,42 +392,28 @@ async def debug() -> JSONResponse:
     }
     return JSONResponse(content=debug_info)
 
-
-@app.get("/set_webhook")
-async def set_webhook() -> JSONResponse:
-    if not telegram_app:
-        return JSONResponse({"ok": False, "error": "telegram app not ready"}, status_code=503)
-    if not RENDER_EXTERNAL_URL:
-        return JSONResponse({"ok": False, "error": "RENDER_EXTERNAL_URL not set"}, status_code=400)
-    try:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
-        await telegram_app.bot.set_webhook(webhook_url, drop_pending_updates=True)
-        return JSONResponse({"ok": True, "url": webhook_url})
-    except Exception as e:
-        logger.error("/set_webhook failed: %s", e)
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-
 @app.post("/webhook")
-async def telegram_webhook(request: Request) -> JSONResponse:
-    global telegram_app
+async def webhook(request: Request):
+    """Handle Telegram webhook"""
     try:
-        if not telegram_app:
-            return JSONResponse({"ok": False, "error": "telegram app not ready"}, status_code=503)
-        data = await request.json()
-        update = Update.de_json(data, telegram_app.bot)
-        await telegram_app.process_update(update)
-        return JSONResponse({"ok": True})
+        # Parse the update
+        update_data = await request.json()
+        update = Update.de_json(update_data, Bot(token=TELEGRAM_TOKEN))
+        
+        # Process the update
+        await handle_message(update, None)
+        
+        return {"status": "ok"}
+        
     except Exception as e:
-        logger.error("Webhook processing failed: %s", e)
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        logger.error(f"Webhook error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.datetime.now().isoformat()}
 
-# -----------------------------
-# Local dev entrypoint (uvicorn)
-# -----------------------------
 if __name__ == "__main__":
-    # For local debugging: uvicorn main:app --reload
     import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
