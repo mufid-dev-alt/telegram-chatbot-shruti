@@ -98,10 +98,18 @@ async def auth_and_set_user():
 def get_user_name(user) -> str:
     """Get user's real name from users.json or fallback to first_name"""
     if not user.username:
+        logger.info(f"User has no username, using first_name: {user.first_name}")
         return user.first_name or "Unknown"
     
     username_lower = user.username.lower()
-    return users_data.get(username_lower, user.first_name or "Unknown")
+    logger.info(f"Looking up username '{username_lower}' in users.json. Available keys: {list(users_data.keys())}")
+    
+    if username_lower in users_data:
+        logger.info(f"Found user '{username_lower}' in users.json, returning: {users_data[username_lower]}")
+        return users_data[username_lower]
+    else:
+        logger.info(f"Username '{username_lower}' not found in users.json, falling back to first_name: {user.first_name}")
+        return user.first_name or "Unknown"
 
 def should_respond(update: Update) -> bool:
     """Check if bot should respond to this message"""
@@ -318,6 +326,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = message.chat.id
         
         # Get user's real name
+        logger.info(f"Raw user data - ID: {user.id}, Username: @{user.username}, First Name: {user.first_name}")
         user_name = get_user_name(user)
         logger.info(f"Processing message from {user_name} (@{user.username})")
         
