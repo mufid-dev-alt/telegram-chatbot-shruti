@@ -96,20 +96,29 @@ async def auth_and_set_user():
         current_user_id = "anonymous_user_" + str(uuid.uuid4())
 
 def get_user_name(user) -> str:
-    """Get user's real name from users.json or fallback to first_name"""
-    if not user.username:
-        logger.info(f"User has no username, using first_name: {user.first_name}")
-        return user.first_name or "Unknown"
+    """Get user's real name from users.json by username or user ID, fallback to first_name"""
+    user_id_str = str(user.id)
+    username_lower = user.username.lower() if user.username else None
     
-    username_lower = user.username.lower()
-    logger.info(f"Looking up username '{username_lower}' in users.json. Available keys: {list(users_data.keys())}")
+    logger.info(f"Looking up user - ID: {user_id_str}, Username: @{user.username}")
     
-    if username_lower in users_data:
-        logger.info(f"Found user '{username_lower}' in users.json, returning: {users_data[username_lower]}")
-        return users_data[username_lower]
-    else:
-        logger.info(f"Username '{username_lower}' not found in users.json, falling back to first_name: {user.first_name}")
-        return user.first_name or "Unknown"
+    # First try to find by username
+    if username_lower and "usernames" in users_data:
+        if username_lower in users_data["usernames"]:
+            real_name = users_data["usernames"][username_lower]
+            logger.info(f"Found user by username '{username_lower}' in users.json, returning: {real_name}")
+            return real_name
+    
+    # Then try to find by user ID
+    if "user_ids" in users_data:
+        if user_id_str in users_data["user_ids"]:
+            real_name = users_data["user_ids"][user_id_str]
+            logger.info(f"Found user by ID '{user_id_str}' in users.json, returning: {real_name}")
+            return real_name
+    
+    # Fallback to first_name
+    logger.info(f"User not found in users.json, falling back to first_name: {user.first_name}")
+    return user.first_name or "Unknown"
 
 def should_respond(update: Update) -> bool:
     """Check if bot should respond to this message"""
@@ -119,7 +128,11 @@ def should_respond(update: Update) -> bool:
     message = update.message
     bot_mention = f"@{bot_username}" if bot_username else None
     
-    # Ignore commands
+    # Allow /whoami command
+    if message.text and message.text.strip() == '/whoami':
+        return True
+    
+    # Ignore other commands
     if message.text and message.text.startswith('/'):
         return False
     
@@ -350,6 +363,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = message.from_user
         chat_id = message.chat.id
         
+        # Handle /whoami command
+        if message.text and message.text.strip() == '/whoami':
+            user_info = f"👤 **User Info:**\n"
+            user_info += f"🆔 **ID:** `{user.id}`\n"
+            user_info += f"👤 **Username:** @{user.username or 'None'}\n"
+            user_info += f"📝 **First Name:** {user.first_name or 'None'}\n"
+            user_info += f"🔍 **Real Name:** {get_user_name(user)}"
+            
+            await message.reply_text(user_info, parse_mode='Markdown')
+            return
+        
         # Get user's real name
         logger.info(f"Raw user data - ID: {user.id}, Username: @{user.username}, First Name: {user.first_name}")
         user_name = get_user_name(user)
@@ -426,6 +450,7 @@ async def debug() -> JSONResponse:
         "app_id": APP_ID,
         "bot_username": bot_username,
         "bot_id": bot_id,
+        "users_data_structure": list(users_data.keys()) if users_data else [],
         "timestamp": datetime.datetime.now().isoformat()
     }
     return JSONResponse(content=debug_info)

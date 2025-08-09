@@ -1,6 +1,14 @@
 {
-  "calmheartache": "Sakshi",
-  "Orewa_kami_desu": "Mufid",
-  "On_my_way_buddy": "Anchal",
-  "Hemsworth_cris": "Infinity"
+  "usernames": {
+    "calmheartache": "Sakshi",
+    "Orewa_kami_desu": "Mufid",
+    "On_my_way_buddy": "Anchal",
+    "Hemsworth_cris": "Infinity"
+  },
+  "user_ids": {
+    "123456789": "Mufid",
+    "987654321": "Sakshi",
+    "456789123": "Anchal",
+    "789123456": "Infinity"
+  }
 }
