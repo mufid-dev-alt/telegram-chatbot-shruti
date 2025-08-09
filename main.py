@@ -14,8 +14,8 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import firebase_admin
 from firebase_admin import credentials, initialize_app, firestore, auth
-from firebase_admin.auth import get_auth
-from firebase_admin.firestore import client
+from firebase_admin import auth
+
 
 # Load environment variables
 load_dotenv()
@@ -55,7 +55,6 @@ try:
         initialize_app(cred)
         logger.info("Firebase initialized.")
     db = firestore.client()
-    auth_instance = get_auth()
 except Exception as e:
     logger.error(f"Failed to initialize Firebase: {e}")
     raise
@@ -81,9 +80,14 @@ async def auth_and_set_user():
     global current_user_id
     try:
         if INITIAL_AUTH_TOKEN:
-            decoded_token = auth_instance.verify_id_token(INITIAL_AUTH_TOKEN)
-            current_user_id = decoded_token['uid']
-            logger.info(f"Signed in with custom token: {current_user_id}")
+            try:
+                decoded_token = auth.verify_id_token(INITIAL_AUTH_TOKEN)
+                current_user_id = decoded_token['uid']
+                logger.info(f"Signed in with custom token: {current_user_id}")
+            except Exception as auth_error:
+                logger.error(f"Token verification failed: {auth_error}")
+                current_user_id = "anonymous_user_" + str(uuid.uuid4())
+                logger.info(f"Using anonymous user ID: {current_user_id}")
         else:
             current_user_id = "anonymous_user_" + str(uuid.uuid4())
             logger.info(f"Using anonymous user ID: {current_user_id}")
