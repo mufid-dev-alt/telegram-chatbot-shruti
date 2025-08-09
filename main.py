@@ -15,7 +15,6 @@ import requests
 from telegram import Update
 from telegram.constants import ChatType, ChatAction
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     ContextTypes,
     MessageHandler,
@@ -429,7 +428,6 @@ async def on_startup() -> None:
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .post_init(post_init)
-        .rate_limiter(AIORateLimiter())
         .build()
     )
 
