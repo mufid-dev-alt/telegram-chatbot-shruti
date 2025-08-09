@@ -240,40 +240,58 @@ async def call_llm_with_retry(payload: Dict[str, Any], headers: Dict[str, str], 
     backoff = 1.0
     for attempt in range(1, max_retries + 1):
         try:
+            logger.info(f"LLM API call attempt {attempt}/{max_retries}")
+            
             def do_post():
                 return requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=20)
 
             response = await asyncio.to_thread(do_post)
+            logger.info(f"LLM API response status: {response.status_code}")
+            
             if response.status_code >= 200 and response.status_code < 300:
-                data = response.json()
-                # Try multiple common schemas
-                text: Optional[str] = None
-                if isinstance(data, dict):
-                    if "choices" in data and data.get("choices"):
-                        choice0 = data["choices"][0]
-                        text = (
-                            choice0.get("message", {}).get("content")
-                            or choice0.get("text")
-                        )
-                    if not text and "output" in data:
-                        text = data.get("output")
-                    if not text and "content" in data and isinstance(data["content"], str):
-                        text = data["content"]
-                    if not text and "candidates" in data:
-                        cand0 = data["candidates"][0] if data["candidates"] else None
-                        if cand0 and isinstance(cand0, dict):
-                            text = cand0.get("content") or cand0.get("text")
-                if text:
-                    return text.strip()
-                else:
-                    logger.error("LLM response schema unexpected: %s", data)
+                try:
+                    data = response.json()
+                    logger.info(f"LLM API response data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                    
+                    # Try multiple common schemas
+                    text: Optional[str] = None
+                    if isinstance(data, dict):
+                        if "choices" in data and data.get("choices"):
+                            choice0 = data["choices"][0]
+                            text = (
+                                choice0.get("message", {}).get("content")
+                                or choice0.get("text")
+                            )
+                        if not text and "output" in data:
+                            text = data.get("output")
+                        if not text and "content" in data and isinstance(data["content"], str):
+                            text = data["content"]
+                        if not text and "candidates" in data:
+                            cand0 = data["candidates"][0] if data["candidates"] else None
+                            if cand0 and isinstance(cand0, dict):
+                                text = cand0.get("content") or cand0.get("text")
+                    
+                    if text:
+                        logger.info(f"Successfully extracted text from LLM response: {text[:100]}...")
+                        return text.strip()
+                    else:
+                        logger.error("LLM response schema unexpected: %s", data)
+                        return None
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse LLM response as JSON: {e}")
+                    logger.error(f"Response text: {response.text[:500]}")
                     return None
             else:
                 logger.warning("LLM non-2xx (attempt %d): %s %s", attempt, response.status_code, response.text)
         except Exception as e:
             logger.error("LLM call failed (attempt %d): %s", attempt, e)
-        await asyncio.sleep(backoff + (0.1 * attempt))
-        backoff *= 2
+            logger.error(f"Exception type: {type(e).__name__}")
+        
+        if attempt < max_retries:
+            await asyncio.sleep(backoff + (0.1 * attempt))
+            backoff *= 2
+    
+    logger.error("All LLM API call attempts failed")
     return None
 
 
@@ -288,8 +306,21 @@ async def generate_shruti_reply(user_name: str, original_message: str, history: 
 
     system_prompt = build_system_persona()
 
+    # Check if we have the required credentials
+    if not GEMINI_API_URL or not GEMINI_API_KEY:
+        logger.warning("LLM credentials missing. Falling back to a canned witty response.")
+        return (
+            f"Hey {user_name}, my brain is on airplane mode right now. "
+            "Try again once the API key finds its coffee."
+        )
+
+    # Log the API call for debugging
+    logger.info(f"Calling LLM API for user {user_name} with message: {original_message[:100]}...")
+    logger.info(f"API URL: {GEMINI_API_URL}")
+    logger.info(f"API Key present: {'Yes' if GEMINI_API_KEY else 'No'}")
+
     payload = {
-        "model": os.getenv("GEMINI_MODEL", "auto"),
+        "model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -309,19 +340,17 @@ async def generate_shruti_reply(user_name: str, original_message: str, history: 
     }
     headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
 
-    if not GEMINI_API_URL or not GEMINI_API_KEY:
-        logger.warning("LLM credentials missing. Falling back to a canned witty response.")
-        return (
-            f"Hey {user_name}, my brain is on airplane mode right now. "
-            "Try again once the API key finds its coffee."
-        )
-
     text = await call_llm_with_retry(payload, headers)
     if text:
+        logger.info(f"LLM response received: {text[:100]}...")
         return text
+    
+    # If we get here, the LLM call failed - provide a more helpful fallback
+    logger.error("LLM API call failed completely")
     return (
-        f"{user_name}, I tried thinking really hard but the internet sneezed. "
-        "Mind asking again?"
+        f"Hey {user_name}! I'm having trouble connecting to my AI brain right now. "
+        "This usually means either my API key is missing, the endpoint is wrong, or the service is down. "
+        "Try again in a bit, or ask me something simple like 'who are you?'"
     )
 
 
@@ -462,6 +491,22 @@ async def on_shutdown() -> None:
 @app.get("/healthz")
 async def health() -> PlainTextResponse:
     return PlainTextResponse("ok")
+
+@app.get("/debug")
+async def debug() -> JSONResponse:
+    """Debug endpoint to check environment variables and API status"""
+    debug_info = {
+        "telegram_token_present": bool(TELEGRAM_TOKEN),
+        "gemini_api_key_present": bool(GEMINI_API_KEY),
+        "gemini_api_url": GEMINI_API_URL,
+        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        "firebase_config_present": bool(FIREBASE_CONFIG),
+        "app_id": APP_ID,
+        "bot_username": bot_username,
+        "bot_id": bot_id,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    return JSONResponse(content=debug_info)
 
 
 @app.get("/set_webhook")
